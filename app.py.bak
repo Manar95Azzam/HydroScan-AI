@@ -1,0 +1,488 @@
+"""
+app.py -- HydroScan AI (NASA Space Apps: Adapting Farms with NASA Data)
+
+Run with:   python -m streamlit run app.py
+Install:    pip install streamlit streamlit-folium folium rasterio scipy scikit-learn pandas numpy joblib
+
+Sidebar: navigation (View 1 / View 2) + a global region selector.
+View 1  Irrigation Detection       real joblib model inference (flatten -> predict -> reshape -> Folium overlay)
+View 2  Crop Rotation Strategies   deterministic rule-based engine on FIXED per-region NASA values
+
+Everything is deterministic: no random buttons, no per-run randomness.
+NASA values below are FIXED illustrative values per region (not a live feed). Replace REGIONS[...] with real
+GPM / POWER / SMAP downloads to go live. Placeholder scenes for the preset regions are synthetic and labelled so;
+if you drop a real GeoTIFF at data/<slug>.tif it is used instead.
+"""
+
+import math
+import os
+import zlib
+
+import folium
+import joblib
+import numpy as np
+import pandas as pd
+import rasterio
+import streamlit as st
+from rasterio.enums import Resampling
+from rasterio.io import MemoryFile
+from rasterio.vrt import WarpedVRT
+from streamlit_folium import st_folium
+
+from model_training import NODATA, make_features
+
+ACRE_M2 = 4046.8564224
+MODEL_CANDIDATES = ["model.pkl", "model.joblib"]
+VIEWS = ["View 1: Irrigation Detection", "View 2: Crop Rotation Strategies"]
+CUSTOM = "Custom Upload"
+
+# ---- static, deterministic NASA values per region (30-day rain total, mean temperature, surface soil moisture)
+REGIONS = {
+    "Toshka, Egypt": {
+        "Rain_GPM": 0.0, "Temp_POWER": 38.5, "Moisture_SMAP": 15.0, "center": (22.85, 31.30), "slug": "toshka",
+        "layout": "pivots", "note": "Hyper-arid desert reclamation area in southern Egypt.",
+    },
+    "Nile Delta, Egypt": {
+        "Rain_GPM": 2.1, "Temp_POWER": 30.0, "Moisture_SMAP": 28.0, "center": (30.90, 31.00), "slug": "nile_delta",
+        "layout": "small_fields", "note": "Dense, intensively irrigated smallholder farmland.",
+    },
+    "California Central Valley, US": {
+        "Rain_GPM": 12.5, "Temp_POWER": 26.0, "Moisture_SMAP": 35.0, "center": (36.70, -119.80), "slug": "california_central_valley",
+        "layout": "blocks", "note": "Large mechanised fields with a Mediterranean climate.",
+    },
+}
+SCENE_SPAN_DEG = 0.06  # placeholder scene is ~6.7 km wide
+
+st.set_page_config(page_title="HydroScan AI", page_icon="💧", layout="wide")
+st.markdown(
+    """
+    <style>
+      .block-container {padding-top: 1.4rem; max-width: 1300px;}
+      h1 {color:#0b3d91; margin-bottom:0;}
+      div[data-testid="stMetric"] {background:#fff; border:1px solid #e3ebf7; border-radius:14px;
+             padding:.7rem 1rem; box-shadow:0 2px 8px rgba(20,60,140,.07);}
+      div[data-testid="stMetricValue"] {color:#0b3d91;}
+      .tag {display:inline-block; background:#fff3cd; color:#7a5b00; border:1px solid #ffe08a;
+            border-radius:999px; padding:.05rem .7rem; font-size:.78rem; font-weight:600;}
+      .top {display:inline-block; background:#d1f4dc; color:#0b6b2e; border:1px solid #9ad9b0;
+            border-radius:999px; padding:.05rem .7rem; font-size:.8rem; font-weight:700;}
+      .chip {display:inline-block; background:#eaf2ff; color:#0b3d91; border-radius:8px;
+             padding:.05rem .55rem; margin:0 .25rem .25rem 0; font-size:.85rem; font-weight:600;}
+      .ctx {border-left:5px solid #19a7ce; background:#f4fafd; border-radius:8px; padding:.9rem 1rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# --------------------------------------------------------------------------- #
+# Sidebar: navigation, then the global region selector
+# --------------------------------------------------------------------------- #
+with st.sidebar:
+    st.markdown("## 💧 HydroScan AI")
+    st.caption("Adapting farms with NASA data")
+    view = st.radio("Navigate", VIEWS, key="view", label_visibility="collapsed")
+    st.divider()
+    region = st.selectbox("📍 Region", list(REGIONS) + [CUSTOM], key="region")
+    if region != CUSTOM:
+        lat, lon = REGIONS[region]["center"]
+        st.caption(f"{REGIONS[region]['note']}  \n{lat:.2f}°, {lon:.2f}°")
+    else:
+        st.caption("Upload your own GeoTIFF in View 1.")
+
+
+# --------------------------------------------------------------------------- #
+# NASA values for the selected region (always the same for the same region / file name)
+# --------------------------------------------------------------------------- #
+def custom_nasa(filename):
+    """Deterministic mock values from a stable hash of the file name (crc32, NOT Python's salted hash())."""
+    store = st.session_state.setdefault("custom_nasa", {})
+    if filename not in store:
+        rng = np.random.default_rng(zlib.crc32(filename.encode("utf-8")))
+        store[filename] = {
+            "Rain_GPM": round(float(rng.uniform(0, 15)), 1),
+            "Temp_POWER": round(float(rng.uniform(22, 40)), 1),
+            "Moisture_SMAP": round(float(rng.uniform(12, 38)), 0),
+        }
+    return store[filename]
+
+
+def nasa_for(region):
+    if region != CUSTOM:
+        r = REGIONS[region]
+        return {k: r[k] for k in ("Rain_GPM", "Temp_POWER", "Moisture_SMAP")}
+    name = st.session_state.get("custom_name")
+    return custom_nasa(name) if name else None
+
+
+# --------------------------------------------------------------------------- #
+# Raster + model helpers
+# --------------------------------------------------------------------------- #
+def _fix_crs(src):
+    crs = src.crs
+    if crs is None:
+        return "EPSG:4326"
+    try:
+        if crs.to_epsg():
+            return crs
+    except Exception:
+        pass
+    text = crs.to_wkt().lower()
+    if "pseudo" in text or "3857" in text or "mercator" in text:
+        return "EPSG:3857"
+    return crs
+
+
+@st.cache_data(show_spinner=False)
+def read_tif(data: bytes, max_dim=1200):
+    """GeoTIFF bytes -> bands (count, H, W) in lat/lon. NoData / non-finite pixels become NaN."""
+    with MemoryFile(data) as mf, mf.open() as src:
+        nd = src.nodata if src.nodata is not None else NODATA
+        names = [(d or "").strip().upper() for d in src.descriptions]
+        with WarpedVRT(src, crs="EPSG:4326", src_crs=_fix_crs(src), src_nodata=nd, nodata=nd,
+                       resampling=Resampling.nearest) as vrt:
+            k = min(1.0, max_dim / max(vrt.width, vrt.height))
+            h, w = max(1, int(vrt.height * k)), max(1, int(vrt.width * k))
+            arr = vrt.read(out_shape=(vrt.count, h, w)).astype("float32")
+            bounds = tuple(vrt.bounds)
+    arr[(arr == nd) | (arr == NODATA) | ~np.isfinite(arr)] = np.nan
+    return {"bands": arr, "bounds": bounds, "names": names}
+
+
+def scene_bounds(center):
+    lat, lon = center
+    h = SCENE_SPAN_DEG / 2
+    return (lon - h, lat - h, lon + h, lat + h)  # west, south, east, north
+
+
+@st.cache_data(show_spinner=False)
+def placeholder_scene(region_name):
+    """Deterministic SYNTHETIC VV/VH/NDVI scene for a preset region (seeded by the region name)."""
+    r = REGIONS[region_name]
+    rng = np.random.default_rng(zlib.crc32(region_name.encode("utf-8")))
+    n = 300
+    yy, xx = np.mgrid[0:n, 0:n]
+    field = np.zeros((n, n), bool)
+    if r["layout"] == "pivots":                      # a few large center-pivot circles
+        for _ in range(5):
+            cy, cx, rad = rng.integers(50, n - 50), rng.integers(50, n - 50), rng.integers(24, 38)
+            field |= (yy - cy) ** 2 + (xx - cx) ** 2 <= rad * rad
+    else:                                            # rectangular parcels
+        size = 22 if r["layout"] == "small_fields" else 60
+        on_prob = 0.65 if r["layout"] == "small_fields" else 0.55
+        for y0 in range(0, n, size):
+            for x0 in range(0, n, size):
+                if rng.random() < on_prob:
+                    field[y0 + 2:y0 + size - 2, x0 + 2:x0 + size - 2] = True
+    ndvi = np.where(field, rng.normal(0.62, 0.07, (n, n)), rng.normal(0.09, 0.03, (n, n)))
+    vv = np.where(field, rng.normal(-9.5, 1.2, (n, n)), rng.normal(-14.5, 1.5, (n, n)))
+    vh = np.where(field, rng.normal(-15.5, 1.2, (n, n)), rng.normal(-22.0, 1.5, (n, n)))
+    return {"bands": np.stack([vv, vh, ndvi]).astype("float32"), "bounds": scene_bounds(r["center"]),
+            "names": ["VV", "VH", "NDVI"]}
+
+
+def region_scene(region_name):
+    """Real GeoTIFF at data/<slug>.tif if present, otherwise the synthetic placeholder."""
+    slug = REGIONS[region_name]["slug"]
+    for base in (os.getcwd(), os.path.dirname(os.path.abspath(__file__))):
+        p = os.path.join(base, "data", f"{slug}.tif")
+        if os.path.isfile(p):
+            with open(p, "rb") as f:
+                return read_tif(f.read()), f"real GeoTIFF data/{slug}.tif"
+    return placeholder_scene(region_name), "synthetic placeholder scene (not real imagery)"
+
+
+def pick_bands(raster):
+    bands, names = raster["bands"], raster["names"]
+    if bands.shape[0] < 3:
+        raise ValueError(f"This file has {bands.shape[0]} band(s); the model needs 3 (VV, VH, NDVI).")
+    if all(n in names for n in ("VV", "VH", "NDVI")):
+        return bands[[names.index("VV"), names.index("VH"), names.index("NDVI")]], "Bands found by name: VV, VH, NDVI."
+    note = "Bands taken by position: 1=VV, 2=VH, 3=NDVI."
+    if bands.shape[0] > 3:
+        note += f" (File has {bands.shape[0]} bands; extra bands ignored.)"
+    return bands[:3], note
+
+
+def find_model():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in MODEL_CANDIDATES:
+        for p in (cand, os.path.join(here, cand)):
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+@st.cache_resource
+def load_model(path):
+    return joblib.load(path)
+
+
+def default_irrigated_classes(classes):
+    names = [str(c) for c in classes]
+    pick = [c for c, n in zip(classes, names) if "irrig" in n.lower() or "dense" in n.lower()]
+    if pick:
+        return pick
+    if set(names) <= {"0", "1"}:
+        return [c for c, n in zip(classes, names) if n == "1"]
+    return [classes[-1]]
+
+
+def run_inference(stack, model, irrigated_classes):
+    """flatten -> model.predict -> reshape -> binary mask. NoData pixels are excluded."""
+    _, H, W = stack.shape
+    valid = np.isfinite(stack).all(axis=0)
+    filled = np.where(np.isfinite(stack), stack, NODATA).astype("float32")
+    n_in = getattr(model, "n_features_in_", 4)
+    if n_in == 4:
+        X = make_features(filled)                  # VV, VH, NDVI, VH-VV (same as training)
+    elif n_in == 3:
+        X = filled.reshape(3, -1).T
+    else:
+        raise ValueError(f"The model expects {n_in} features; this app supplies 3 or 4.")
+    X = np.asarray(X)
+    flat_valid = valid.ravel()
+    pred = np.full(H * W, None, dtype=object)
+    if flat_valid.any():
+        pred[flat_valid] = model.predict(X[flat_valid])
+    pred = pred.reshape(H, W)
+    return valid & np.isin(pred, list(irrigated_classes)), valid, pred
+
+
+def pixel_area_m2(bounds, shape):
+    w, s, e, n = bounds
+    h_px, w_px = shape
+    return ((e - w) / w_px * 111_320 * math.cos(math.radians((s + n) / 2))) * ((n - s) / h_px * 110_540)
+
+
+def base_map(bounds):
+    w_, s_, e_, n_ = bounds
+    m = folium.Map(location=[(s_ + n_) / 2, (w_ + e_) / 2], zoom_start=13, tiles=None, control_scale=True)
+    folium.TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                     attr="Esri World Imagery", name="Satellite").add_to(m)
+    m.fit_bounds([[s_, w_], [n_, e_]])
+    return m
+
+
+# =========================================================================== #
+# VIEW 1: IRRIGATION DETECTION
+# =========================================================================== #
+if view == VIEWS[0]:
+    st.title("Irrigation Detection")
+    st.caption(f"Region: **{region}**")
+
+    top_l, top_r = st.columns([3, 2])
+    upload = None
+    with top_l:
+        if region == CUSTOM:
+            upload = st.file_uploader("GeoTIFF (.tif) with VV, VH, NDVI", type=["tif", "tiff"], key="custom_upload")
+            if upload is not None:
+                st.session_state["custom_name"] = upload.name
+        else:
+            st.info("Preset region: the scene area is shown on the map. Press **Run AI Detection** to analyse it.")
+    with top_r:
+        model_path = find_model()
+        if model_path:
+            st.success(f"Model ready: `{os.path.basename(model_path)}`")
+        else:
+            st.error("No `model.pkl` / `model.joblib` next to app.py. Run `python model_training.py` first.")
+
+    ready = model_path is not None and (region != CUSTOM or upload is not None)
+    go = st.button("🚀 Run AI Detection", type="primary", disabled=not ready)
+    run_key = f"{region}|{upload.name if upload is not None else ''}"
+
+    if go:
+        with st.spinner("Reading raster and running the model..."):
+            try:
+                if region == CUSTOM:
+                    raster, source = read_tif(upload.getvalue()), f"uploaded file {upload.name}"
+                else:
+                    raster, source = region_scene(region)
+                stack, note = pick_bands(raster)
+                model = load_model(model_path)
+                classes = list(model.classes_)
+                irr_classes = default_irrigated_classes(classes)
+                mask, valid, pred = run_inference(stack, model, irr_classes)
+                st.session_state["det"] = {
+                    "key": run_key, "bounds": raster["bounds"], "mask": mask, "valid": valid, "pred": pred,
+                    "note": note, "source": source, "classes": classes, "irr_classes": irr_classes,
+                    "px_area": pixel_area_m2(raster["bounds"], mask.shape),
+                }
+            except Exception as exc:
+                st.session_state.pop("det", None)
+                st.error(f"Detection failed: {exc}")
+
+    det = st.session_state.get("det")
+    if det and det["key"] == run_key:
+        with st.expander("Which model classes count as irrigated?"):
+            chosen = st.multiselect("Classes", det["classes"], default=det["irr_classes"], key=f"pick_{run_key}")
+        chosen = chosen or det["irr_classes"]
+        mask = det["valid"] & np.isin(det["pred"], chosen)
+
+        n_valid = int(det["valid"].sum())
+        irr_acres = mask.sum() * det["px_area"] / ACRE_M2
+        tot_acres = n_valid * det["px_area"] / ACRE_M2
+        share = irr_acres / max(tot_acres, 1e-9)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("💧 Irrigated land", f"{irr_acres:,.0f} acres")
+        m2.metric("Share of valid area", f"{100 * share:.1f} %")
+        m3.metric("NoData excluded", f"{100 * (1 - n_valid / mask.size):.1f} %")
+
+        map_col, ctx_col = st.columns([3, 1.3])
+        with map_col:
+            m = base_map(det["bounds"])
+            w_, s_, e_, n_ = det["bounds"]
+            rgba = np.zeros((*mask.shape, 4), np.uint8)
+            rgba[mask] = (30, 110, 255, 180)
+            folium.raster_layers.ImageOverlay(rgba, bounds=[[s_, w_], [n_, e_]], name="Irrigated land (model)").add_to(m)
+            folium.LayerControl(collapsed=True).add_to(m)
+            st_folium(m, height=540, use_container_width=True, returned_objects=[], key=f"map_{run_key}")
+            st.caption(f"Source: {det['source']} · blue = model class {', '.join(map(str, chosen))} · {det['note']}")
+
+        with ctx_col:
+            st.markdown("#### 🛰️ NASA Context")
+            nasa = nasa_for(region)
+            if region == CUSTOM:
+                st.markdown('<span class="tag">mock values from file name</span>', unsafe_allow_html=True)
+            else:
+                st.markdown('<span class="tag">fixed illustrative values</span>', unsafe_allow_html=True)
+            rain, smap = nasa["Rain_GPM"], nasa["Moisture_SMAP"]
+            if share < 0.05:
+                body = ("<b>AI detects little vegetation</b> in this scene, so there is no irrigation signal to "
+                        "check against rainfall or soil moisture.")
+            else:
+                rain_txt = ("confirms <b>no meaningful rainfall</b>" if rain <= 5 else "shows <b>recent rainfall</b>")
+                smap_txt = (f"shows <b>active soil moisture ({smap:.0f}%)</b>" if smap >= 25 else
+                            f"shows <b>low regional soil moisture ({smap:.0f}%)</b>")
+                if rain <= 5:
+                    verdict = "Confirmed Human Irrigation"
+                elif rain <= 20:
+                    verdict = "Probable irrigation; recent rain may add to the greenness"
+                else:
+                    verdict = "Possibly rain-fed; irrigation not confirmed"
+                body = (f"<b>AI detects high vegetation.</b><br>NASA GPM {rain_txt} ({rain:.1f} mm, 30 days).<br>"
+                        f"NASA SMAP {smap_txt}.<br><br><b>Conclusion: {verdict}.</b>")
+            st.markdown(f'<div class="ctx">{body}</div>', unsafe_allow_html=True)
+            st.caption("SMAP is ~10 km coarse: it describes the region, not single fields.")
+    else:
+        if region == CUSTOM and upload is None:
+            st.info("Select a `.tif` to begin.")
+        else:
+            scene = scene_bounds(REGIONS[region]["center"]) if region != CUSTOM else None
+            if scene:
+                m = base_map(scene)
+                w_, s_, e_, n_ = scene
+                folium.Rectangle([[s_, w_], [n_, e_]], color="#19c3e6", weight=2, fill=False,
+                                 tooltip="Analysis area").add_to(m)
+                st_folium(m, height=480, use_container_width=True, returned_objects=[], key=f"ph_{region}")
+                _, src_note = region_scene(region)
+                st.caption(f"Placeholder view of the analysis area · scene source when run: {src_note}.")
+
+
+# =========================================================================== #
+# VIEW 2: CROP ROTATION STRATEGIES
+# =========================================================================== #
+else:
+    st.title("Crop Rotation Strategies")
+    nasa = nasa_for(region)
+    if nasa is None:
+        st.info("Custom Upload is selected. Upload a `.tif` in View 1 first; its file name defines this region's NASA values.")
+        st.stop()
+
+    rain, temp, smap = nasa["Rain_GPM"], nasa["Temp_POWER"], nasa["Moisture_SMAP"]
+    label = region if region != CUSTOM else f"{CUSTOM} ({st.session_state['custom_name']})"
+    st.caption(f"Region: **{label}**")
+    st.markdown('<span class="tag">fixed illustrative NASA values · not a live feed</span>' if region != CUSTOM
+                else '<span class="tag">mock values from a stable hash of the file name</span>', unsafe_allow_html=True)
+
+    rain_lbl = "Very low" if rain <= 5 else "Moderate" if rain <= 15 else "High"
+    temp_lbl = "Very hot" if temp >= 35 else "Hot" if temp >= 30 else "Warm" if temp >= 25 else "Mild"
+    smap_lbl = "Very dry" if smap < 20 else "Moderate" if smap < 30 else "Moist"
+    c1, c2, c3 = st.columns(3)
+    c1.metric("🌧️ Rainfall · NASA GPM", f"{rain:.1f} mm", f"30-day total · {rain_lbl}", delta_color="off")
+    c2.metric("🌡️ Temperature · NASA POWER", f"{temp:.1f} °C", f"mean · {temp_lbl}", delta_color="off")
+    c3.metric("💧 Soil moisture · NASA SMAP", f"{smap:.0f} %", f"surface · {smap_lbl}", delta_color="off")
+
+    # ---- deterministic rule-based engine -----------------------------------------
+    clamp = lambda x: max(0.0, min(1.0, x))
+    dryness = clamp((35 - smap) / 20)                  # 1 = very dry soil
+    heat = clamp((temp - 25) / 15)                     # 1 = 40 C
+    no_rain = clamp(1 - rain / 10)                     # 1 = no rain
+    water_stress = 0.45 * dryness + 0.35 * heat + 0.20 * no_rain
+    moist_mid = clamp(1 - abs(smap - 27) / 15)         # legumes establish best at moderate moisture
+    temp_fit = clamp(1 - max(0.0, temp - 30) / 10)
+
+    raw = (40 + 60 * water_stress,
+           30 + 40 * moist_mid + 20 * (1 - heat) + 10 * clamp(rain / 10),
+           20 + 55 * (1 - water_stress) ** 2 + 25 * temp_fit)
+    scores = [int(round(min(100, s))) for s in raw]
+    order = sorted(range(3), key=lambda i: (-raw[i], i))  # ties broken by fixed order
+    best = order[0]
+    stress_word = "high" if water_stress > 0.6 else "moderate" if water_stress > 0.35 else "low"
+
+    strategies = [
+        {"name": "Water Conservation", "icon": "💧", "crops": ["Sorghum", "Barley", "Pearl millet"],
+         "timing": [("☀️ Summer", "Sorghum, pearl millet (heat tolerant)"), ("❄️ Winter", "Barley (matures before the hottest months)")],
+         "benefits": ["Lowest irrigation demand", "Tolerates heat and dry spells", "Keeps land productive when water is scarce"],
+         "watch": "Lower market price and yield than wheat or maize.",
+         "fit": (f"Water stress is **{stress_word}** here ({smap_lbl.lower()} soil at {smap:.0f}%, {temp_lbl.lower()} at {temp:.1f} °C, "
+                 f"{rain:.1f} mm rain). Crops that need less irrigation water protect scarce supplies.")},
+        {"name": "Soil Health", "icon": "🌱", "crops": ["Faba bean", "Berseem clover", "Chickpea", "Cowpea", "Alfalfa"],
+         "timing": [("❄️ Winter", "Faba bean, berseem clover, chickpea (best window)"),
+                    ("☀️ Summer", "Cowpea; alfalfa only with reliable irrigation")],
+         "benefits": ["Fixes nitrogen, so less fertiliser is needed", "Breaks cereal pest and disease cycles", "Builds soil organic matter"],
+         "watch": "Alfalfa uses a lot of water; avoid it when water stress is high.",
+         "fit": (f"Soil moisture of {smap:.0f}% is {'in the range where legumes establish well' if moist_mid > 0.6 else 'not ideal for legume establishment, so irrigation must be managed'}, "
+                 f"and {temp:.1f} °C is {'cool enough for most legumes' if temp < 32 else 'hot, so choose cool-season (winter) legumes'}.")},
+        {"name": "Market Yield", "icon": "📈", "crops": ["Wheat", "Maize"],
+         "timing": [("❄️ Winter", "Wheat (core crop in Egypt; best choice)"), ("☀️ Summer", "Maize, only if irrigation is guaranteed")],
+         "benefits": ["Highest yield and income potential", "Strong, established markets", "Well-known farming practices"],
+         "watch": "Highest water and fertiliser demand; heat at flowering cuts yield.",
+         "fit": (f"Water stress is **{stress_word}** and {temp:.1f} °C is {'inside' if temp <= 30 else 'above'} the comfortable range for "
+                 f"wheat and maize, with {rain:.1f} mm of recent rain and {smap:.0f}% soil moisture to support high-demand crops.")},
+    ]
+
+    top = strategies[best]
+    st.markdown("### Recommendation")
+    st.success(f"**{top['icon']} {top['name']}** is the best fit for {label} "
+               f"(fit score {scores[best]}/100). Crops: {', '.join(top['crops'])}.")
+    with st.expander(f"Why {top['name']} fits {label}", expanded=True):
+        st.markdown(f"- **Rainfall (GPM): {rain:.1f} mm** - {rain_lbl.lower()}; "
+                    f"{'almost no natural water input, so crops depend on irrigation.' if rain <= 5 else 'some natural water input, but not enough to rely on alone.' if rain <= 15 else 'substantial natural water input.'}")
+        st.markdown(f"- **Temperature (POWER): {temp:.1f} °C** - {temp_lbl.lower()}; "
+                    f"{'heat raises crop water demand and limits high-demand crops.' if temp >= 33 else 'within a workable range for most crops.' if temp >= 25 else 'mild.'}")
+        st.markdown(f"- **Soil moisture (SMAP): {smap:.0f}%** - {smap_lbl.lower()}; "
+                    f"{'little stored water in the root zone.' if smap < 20 else 'a moderate water reserve.' if smap < 30 else 'a healthy water reserve.'}")
+        st.markdown(f"**Reasoning:** {top['fit']}")
+        st.markdown("**Seasonal timing**")
+        for season, text in top["timing"]:
+            st.markdown(f"- {season}: {text}")
+        st.markdown("**Benefits**")
+        for b in top["benefits"]:
+            st.markdown(f"- {b}")
+        st.caption(f"Watch out: {top['watch']}")
+
+    st.markdown("### All three strategies")
+    cols = st.columns(3)
+    for col, i in zip(cols, range(3)):
+        s = strategies[i]
+        with col, st.container(border=True):
+            st.markdown('<span class="top">✅ Recommended</span>' if i == best else f"Priority {order.index(i) + 1}",
+                        unsafe_allow_html=True)
+            st.markdown(f"#### {s['icon']} {s['name']}")
+            st.markdown("".join(f'<span class="chip">{c}</span>' for c in s["crops"][:3]), unsafe_allow_html=True)
+            st.metric("Fit score", f"{scores[i]} / 100")
+            st.progress(scores[i] / 100)
+            st.markdown(f"**Why:** {s['fit']}")
+
+    with st.expander("How the rules score each strategy"):
+        st.markdown(
+            """
+**Water stress** = 45% dry soil (SMAP below 35%) + 35% heat (POWER above 25 °C) + 20% lack of rain (GPM below 10 mm).
+- **Water Conservation** rises with water stress.
+- **Soil Health** peaks at moderate soil moisture (~27%), cooler temperature and some rain.
+- **Market Yield** rises when water stress is low and temperature is at or below 30 °C.
+
+Same inputs always give the same answer. These are simple agronomic rules for decision support, **not** a validated yield model.
+            """
+        )
