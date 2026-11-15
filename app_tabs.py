@@ -92,7 +92,7 @@ with st.sidebar:
 
     st.divider()
     st.header("🌱 Irrigated-land detection")
-    project = st.text_input("Earth Engine project ID", help="Needed for real detection. "
+    project = st.text_input("", help="Needed for real detection. "
                             "Leave empty to see demo polygons.")
     start = st.date_input("Period starts", value=dt.date.today() - dt.timedelta(days=365))
     days = st.slider("Period length (days)", 30, 730, 365, 5,
@@ -518,7 +518,7 @@ with tab_irr:
     if result:
         real = result["mode"] == "real"
         if not real:
-            st.warning("DEMO MODE: these blue shapes are random. Enter your Earth Engine project ID in the "
+            st.warning("DEMO MODE: these blue shapes are random. Enter your  in the "
                        "sidebar to detect real irrigated land for this box.")
 
         m1, m2, m3, m4 = st.columns(4)
@@ -568,7 +568,7 @@ with tab_irr:
                 fig.colorbar(im, ax=ax, shrink=0.8, label="NDVI (greenness)")
                 st.pyplot(fig)
             else:
-                st.info("NDVI view needs real detection (enter your Earth Engine project ID).")
+                st.info("NDVI view needs real detection (enter your ).")
 
         with t_method:
             if real:
@@ -610,7 +610,7 @@ fields and fields under cloud all year can be missed. This is an estimate from s
 
     if run:
         if not project.strip():
-            st.error("Enter your Earth Engine project ID in the sidebar.")
+            st.error("Enter your  in the sidebar.")
             st.stop()
         import gee_pipeline as gp  # loaded only when needed
 
